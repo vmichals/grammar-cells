@@ -33,6 +33,9 @@ class SGD_Trainer(object):
             name='inputs')
         self._numcases = self._inputs.shape[0]
         self._numloads = self._numcases // self._loadsize
+        print 'recompiling trainer functions...'
+        self._compile_functions()
+
 
     @property
     def gradient_clip_threshold(self):
@@ -107,16 +110,33 @@ class SGD_Trainer(object):
         return self._momentum_batchcounter
 #}}}
 
-    def __init__(self, model, inputs, batchsize, learningrate,
+    def __init__(self, model=None, inputs=None, batchsize=100, learningrate=.01,
                  momentum=0.9, loadsize=None,
                  rng=None, verbose=True,
                  numcases=None, gradient_clip_threshold=1000,
-                 valid_inputs=None,
-                 patience=None, patience_increase=None,
-                 improvement_threshold=None,
-                 validation_frequency=None, numepochs_per_load=1):
+                 numepochs_per_load=1,
+                 rmsprop=None, cost=None, params=None, inputvar=None,
+                 grads=None):
 
 #{{{ Initialization of Properties
+        assert model is not None or (
+            cost is not None and params is not None and
+            inputvar is not None and grads is not None), (
+                "either a model instance or cost, params and inputvar "
+                "have to be passed to the SGD_Trainer constructor")
+
+        if model is not None:
+            self._model = model
+            self._params = model.params
+            self._cost = model._cost
+            self._inputvar = model.inputs
+            self._grads = model._grads
+        else:
+            self._params = params
+            self._cost = cost
+            self._inputvar = inputvar
+            self._grads = grads
+
         self._learningrate = theano.shared(np.float32(learningrate),
                                            name='learningrate')
         self.numepochs_per_load = numepochs_per_load
@@ -152,38 +172,7 @@ class SGD_Trainer(object):
         self._model = model
 
         self._numparams = reduce(lambda x,y: x+y,
-            [p.get_value().size for p in self._model.params])
-
-        if valid_inputs is None:
-            self._valid_inputs = valid_inputs
-        else:
-            if isinstance(valid_inputs, str):
-                self._valid_inputs_type = 'h5'
-                self._valid_inputsfile = tables.openFile(valid_inputs, 'r')
-                self._valid_inputs = self._valid_inputsfile.root.inputs_white
-            else:
-                self._valid_inputs_type = 'numpy'
-                self._valid_inputs = valid_inputs
-            self._valid_inputs_theano = theano.shared(
-                self._valid_inputs)
-            self._best_valid_params = \
-            dict([(p.name, np.zeros(p.get_value().shape,
-                                dtype=theano.config.floatX))
-                                for p in self._model.params])
-            self._best_valid_cost = np.infty
-            self._patience = patience
-            if patience_increase is None:
-                print 'WARNING: using default value of 1.3 for patience increase'
-                patience_increase = 1.3
-            self._patience_increase = patience_increase
-            if improvement_threshold is None:
-                print 'WARNING: using default value of 0.98 for improvement threshold'
-                improvement_threshold= 0.98
-            self._improvement_threshold = improvement_threshold
-            if validation_frequency is None:
-                validation_frequency = min(self._inputs.shape[0]/batchsize, self._patience/2)
-            self._validation_frequency = validation_frequency
-
+            [p.get_value().size for p in self._params])
 
         if self._inputs_type == 'function':
             numcases = loadsize
@@ -233,13 +222,21 @@ class SGD_Trainer(object):
             self._rng = rng
 
         self._epochcount = 0
-        self.epoch_of_last_valid_improvement = 0
         self._index = T.lscalar()
         self._incs = \
           dict([(p, theano.shared(value=np.zeros(p.get_value().shape,
                             dtype=theano.config.floatX), name='inc_'+p.name))
-                            for p in self._model.params])
+                            for p in self._params])
         self._inc_updates = collections.OrderedDict()
+        self.rmsprop = rmsprop
+        if self.rmsprop is not None:
+            self.averaging_coeff=0.95
+            self.stabilizer=1e-2
+            self._avg_grad_sqrs = \
+              dict([(p, theano.shared(value=np.zeros(p.get_value().shape,
+                                dtype=theano.config.floatX), name='avg_grad_sqr_'+p.name))
+                                for p in self._params])
+        self._avg_grad_sqrs_updates = collections.OrderedDict()
         self._updates_nomomentum = collections.OrderedDict()
         self._updates = collections.OrderedDict()
         self._n = T.lscalar('n')
@@ -247,6 +244,8 @@ class SGD_Trainer(object):
         self._noop = 0.0 * self._n
         self._batch_idx = theano.shared(
             value=np.array(0, dtype=np.int64), name='batch_idx')
+
+        self.costs = []
         self._compile_functions()
 
 #}}}
@@ -254,9 +253,6 @@ class SGD_Trainer(object):
     def __del__(self):
         if self._inputs_type == 'h5':
             self._inputsfile.close()
-        if self._valid_inputs is not None:
-            if self._valid_inputs_type == 'h5':
-                self._valid_inputsfile.close()
 
     def save(self, filename):
         """Saves the trainers parameters to a file
@@ -294,8 +290,12 @@ class SGD_Trainer(object):
         paramfile.createArray(paramfile.root, 'momentum_batchcounter',
                               self.momentum_batchcounter)
         incsgrp = paramfile.createGroup(paramfile.root, 'incs', 'increments')
-        for p in self._model.params:
+        for p in self._params:
             paramfile.createArray(incsgrp, p.name, self._incs[p].get_value())
+        if self.rmsprop is not None:
+            avg_grad_sqrs_grp = paramfile.createGroup(paramfile.root, 'avg_grad_sqrs')
+            for p in self._params:
+                paramfile.createArray(avg_grad_sqrs_grp, p.name, self._avg_grad_sqrs[p].get_value())
         paramfile.close()
 
     def save_pkl(self, filename):
@@ -312,7 +312,10 @@ class SGD_Trainer(object):
         param_dict['epochcount'] = self.epochcount
         param_dict['momentum_batchcounter'] = self.momentum_batchcounter
         param_dict['incs'] = dict(
-            [(p.name, self._incs[p].get_value()) for p in self._model.params])
+            [(p.name, self._incs[p].get_value()) for p in self._params])
+        if self.rmsprop is not None:
+            param_dict['avg_grad_sqrs'] = dict(
+                [(p.name, self._avg_grad_sqrs[p].get_value()) for p in self._params])
         pickle.dump(param_dict, open(filename, 'wb'))
 
     def load(self, filename):
@@ -329,9 +332,14 @@ class SGD_Trainer(object):
         self.epochcount = param_dict['epochcount']
         self._momentum_batchcounter = param_dict['momentum_batchcounter']
         for param_name in param_dict['incs'].keys():
-            for p in self._model.params:
+            for p in self._params:
                 if p.name == param_name:
                     self._incs[p].set_value(param_dict['incs'][param_name])
+        if self.rmsprop is not None:
+            for param_name in param_dict['avg_grad_sqrs'].keys():
+                for p in self._params:
+                    if p.name == param_name:
+                        self._avg_grad_sqrs[p].set_value(param_dict['avg_grad_sqrs'][param_name])
         self._numbatches = self._loadsize // self._batchsize
         if self._inputs_type != 'function':
             self._numloads = self._inputs.shape[0] // self._loadsize
@@ -342,20 +350,34 @@ class SGD_Trainer(object):
             self._inputs_theano.set_value(self._inputs[:self._loadsize])
 
     def reset_incs(self):
-        for p in self._model.params:
+        for p in self._params:
             self._incs[p].set_value(
                 np.zeros(p.get_value().shape, dtype=theano.config.floatX))
 
+    def reset_avg_grad_sqrs(self):
+        for p in self._params:
+            self._avg_grad_sqrs[p].set_value(
+                np.zeros(p.get_value().shape, dtype=theano.config.floatX))
+
     def _compile_functions(self):
-        _gradnorm = T.zeros([])
-        for _grad in self._model._grads:
-            _gradnorm += T.sum(_grad**2)
-        self._gradnorm = T.sqrt(_gradnorm)
+        self._gradnorm = T.zeros([])
+        for _param, _grad in zip(self._params, self._grads):
+            # apply rmsprop to before clipping gradients
+            if self.rmsprop is not None:
+                avg_grad_sqr = self._avg_grad_sqrs[_param]
+                new_avg_grad_sqr =  self.averaging_coeff * avg_grad_sqr + \
+                    (1 - self.averaging_coeff) * T.sqr(_grad)
+                self._avg_grad_sqrs_updates[avg_grad_sqr] = new_avg_grad_sqr
+                rms_grad_t = T.sqrt(new_avg_grad_sqr)
+                rms_grad_t = T.maximum(rms_grad_t, self.stabilizer)
+                _grad = _grad / rms_grad_t
+            self._gradnorm += T.sum(_grad**2) # calculated on the rmsprop 'grad'
+        self._gradnorm = T.sqrt(self._gradnorm)
         self.gradnorm = theano.function(
             inputs=[],
-            outputs=_gradnorm,
+            outputs=self._gradnorm,
             givens={
-                self._model.inputs:
+                self._inputvar:
                 self._inputs_theano[
                     self._batch_idx*self.batchsize:
                     (self._batch_idx+1)*self.batchsize]})
@@ -363,24 +385,16 @@ class SGD_Trainer(object):
         avg_gradnorm_update = {
             self._avg_gradnorm: self._avg_gradnorm * .8 + self._gradnorm * .2}
 
-        for _param, _grad in zip(self._model.params, self._model._grads):
+        for _param, _grad in zip(self._params, self._grads):
             if hasattr(self._model, 'skip_params'):
                 if _param.name in self._model.skip_params:
                     continue
+
             _clip_grad = T.switch(
-                T.gt(_gradnorm, self._gradient_clip_threshold),
-                _grad * T.switch(
-                    T.gt(self._avg_gradnorm, 1.),
-                    self._avg_gradnorm, 1.) / _gradnorm, _grad)
+                T.gt(self._gradnorm, self._gradient_clip_threshold),
+                _grad * self._gradient_clip_threshold / self._gradnorm, _grad)
 
-            self._inc_updates[self._incs[_param]] = \
-                    self._momentum * self._incs[_param] - \
-                    self._learningrate * _grad
-            self._updates[_param] = _param + self._incs[_param]
-            self._updates_nomomentum[_param] = \
-                    _param - self._learningrate * _clip_grad
-
-            try:
+            try: # ... to apply learningrate_modifiers
                 # Cliphid version:
                 self._inc_updates[self._incs[_param]] = \
                         self._momentum * self._incs[_param] - \
@@ -392,6 +406,7 @@ class SGD_Trainer(object):
                     self._learningrate * \
                     self._model.layer.learningrate_modifiers[_param.name] * \
                         _clip_grad
+
             except AttributeError:
                 self._inc_updates[self._incs[_param]] = self._momentum * \
                         self._incs[_param] - self._learningrate * _clip_grad
@@ -404,8 +419,8 @@ class SGD_Trainer(object):
         # so that it is considered in the parameter update computations
         ordered_updates.update(self._inc_updates)
         self._updateincs = theano.function(
-            [], [self._model._cost, self._avg_gradnorm], updates = ordered_updates,
-            givens = {self._model.inputs:self._inputs_theano[
+            [], [self._cost, self._avg_gradnorm], updates = ordered_updates,
+            givens = {self._inputvar:self._inputs_theano[
                 self._batch_idx*self._batchsize:(self._batch_idx+1)* \
                 self._batchsize]})
 
@@ -414,23 +429,21 @@ class SGD_Trainer(object):
 
         self._trainmodel_nomomentum = theano.function(
             [self._n], self._noop, updates = self._updates_nomomentum,
-            givens = {self._model.inputs:self._inputs_theano[
+            givens = {self._inputvar:self._inputs_theano[
                 self._batch_idx*self._batchsize:(self._batch_idx+1)* \
                 self._batchsize]})
-        if self._valid_inputs is not None:
-            self._compute_validcost = theano.function(
-                [self._n], self._model._validcost,
-                givens = {self._model.inputs:
-                        self._valid_inputs_theano[
-                            self._n*self._batchsize:(self._n+1)*
-                            self._batchsize]})
 
         self._momentum_batchcounter = 0
+
 
     def _trainsubstep(self, batchidx):
         self._batch_idx.set_value(batchidx)
         stepcost, avg_gradnorm = self._updateincs()
-
+        # catch NaN, before updating params
+        if np.isnan(stepcost):
+            raise ValueError, 'Cost function returned nan!'
+        elif np.isinf(stepcost):
+            raise ValueError, 'Cost function returned infinity!'
 
         if self._momentum_batchcounter < 10:
             self._momentum_batchcounter += 1
@@ -439,14 +452,6 @@ class SGD_Trainer(object):
             self._momentum_batchcounter = 10
             self._trainmodel(0)
         return stepcost, avg_gradnorm
-
-    def compute_validcost(self):
-        n_batches = self._valid_inputs.shape[0] / self.batchsize
-        validcost = 0.0
-        for batch_idx in range(n_batches):
-            validcost += self._compute_validcost(batch_idx)
-        validcost /= n_batches
-        return validcost
 
     def get_avg_gradnorm(self):
         avg_gradnorm = 0.0
@@ -459,12 +464,12 @@ class SGD_Trainer(object):
         return avg_gradnorm
 
     def step(self):
+        total_cost = 0.0
         cost = 0.0
         stepcount = 0.0
 
         self._epochcount += 1
 
-        patience_expired = False
         for load_index in range(self._numloads):
             indices = np.random.permutation(self._loadsize)
             if self._inputs_type == 'h5':
@@ -482,7 +487,6 @@ class SGD_Trainer(object):
                         inp[i] = self._inputs_fn()
                         if (i + 1) % 100 == 0:
                             print '{0}/{1}'.format(i + 1, self.loadsize)
-
                     self._inputs_theano.set_value(inp)
                     print 'done'
             else:
@@ -494,52 +498,10 @@ class SGD_Trainer(object):
                 stepcost, avg_gradnorm = self._trainsubstep(batch_index)
                 cost = (1.0-1.0/stepcount)*cost + (1.0/stepcount)* \
                     stepcost
-                if self._valid_inputs is not None:
-                    if int(self._total_stepcount) % self._validation_frequency == 0:
-                        print 'validation...'
-                        #validate TODO: implement theano validation function
-                        valid_cost = self.compute_validcost()
-                        print 'valid_cost: {0}'.format(valid_cost)
-                        if valid_cost < self._best_valid_cost * self._improvement_threshold:
-                            self._patience = max(self._patience, self._total_stepcount * self._patience_increase)
-                            for p in self._model.params:
-                                self._best_valid_params[p.name] = p.get_value()
-                            self._best_valid_cost = valid_cost
-                            print 'new best valid cost: {0}'.format(self._best_valid_cost)
-                            self.epoch_of_last_valid_improvement = self._epochcount
-                    if self._patience <= self._total_stepcount:
-                        #signal stop (returned at end of step)
-                        patience_expired = True
-
             if self._verbose:
                 print '> epoch {0:d}, load {1:d}/{2:d}, cost: {3:f}, avg. gradnorm: {4}'.format(
                     self._epochcount, load_index + 1, self._numloads, cost, avg_gradnorm)
-            if np.isnan(cost):
-                raise ValueError, 'Cost function returned nan!'
-            elif np.isinf(cost):
-                raise ValueError, 'Cost function returned infinity!'
-        if patience_expired:
-            print 'patience expired'
-        return patience_expired
-
-
-if __name__ == '__main__':
-    import factoredGAE
-    DATAPATH = os.environ['DATAPATH']
-    datafile = tables.openFile(
-        os.path.join(DATAPATH, 'Berkshft_1260_13_10.h5'))
-    data = datafile.root.data_white[:10000, :]
-    horizon = 10
-    nvis = data.shape[-1] // horizon
-
-    model = factoredGAE.FactoredGAE(
-        numvisX=nvis, numvisY=nvis, numfac=256, nummap=128,
-        numhid=0, output_type='real')
-
-    trainer = SGD_Trainer(
-        model, inputs=data[:, :2*nvis], batchsize=100,
-        loadsize=10000, learningrate=0.0001)
-    trainer.step()
-    trainer.save('/tmp/test.pkl')
-    trainer.load('/tmp/test.pkl')
-    trainer.save('/tmp/test.h5')
+                if hasattr(self._model, 'monitor'):
+                    self._model.monitor()
+        self.costs.append(cost)
+        return cost
